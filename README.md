@@ -5,12 +5,10 @@
   <img src="https://img.shields.io/badge/LangGraph-tool--calling-orange?style=for-the-badge" />
   <img src="https://img.shields.io/badge/MCP-FastMCP-purple?style=for-the-badge" />
   <img src="https://img.shields.io/badge/mémoire-dual--brain-green?style=for-the-badge" />
+  <img src="https://img.shields.io/badge/apprentissage-non--paramétrique-red?style=for-the-badge" />
 </p>
 
-> **Agent IA conversationnel basé sur l'utilisation d'outils (tool-calling), piloté depuis une interface terminal (TUI).** L'agent dialogue avec un LLM, appelle des outils distants via le protocole **MCP** et conserve une **mémoire long terme** entre les sessions.
-
-<!-- 📸 SUGGESTION : insérer ici un screenshot de la TUI en action (conversation + panneaux rich) -->
-<!-- ![TUI Screenshot](./docs/tui-demo.png) -->
+> **Agent IA conversationnel basé sur l'utilisation d'outils (tool-calling), piloté depuis une interface terminal (TUI).** L'agent dialogue avec un LLM, appelle des outils distants via le protocole **MCP**, conserve une **mémoire long terme** entre les sessions et **apprend de ses erreurs d'outil**.
 
 ---
 
@@ -19,6 +17,7 @@
 - [✨ Fonctionnalités](#-fonctionnalités)
 - [🏗️ Architecture](#️-architecture)
 - [🧠 Mémoire Dual-Brain](#-mémoire-dual-brain)
+- [🎓 Apprentissage (RAG de leçons)](#-apprentissage-rag-de-leçons)
 - [🗂️ Structure du dépôt](#️-structure-du-dépôt)
 - [🚀 Démarrage rapide](#-démarrage-rapide)
 - [⚙️ Configuration](#️-configuration)
@@ -37,13 +36,14 @@
   - Résumé compact persisté (SQLite) déclenché par seuil de tokens.
   - Faits atomiques catégorisés indexés en vectoriel (ChromaDB) et récupérés par similarité (RAG), avec seuil de pertinence et dédoublonnage sémantique.
 - 📚 **RAG de connaissances** (optionnel) : injecte des connaissances de référence (doc, pages web) ingérées hors-ligne dans une collection ChromaDB distincte, en lecture seule, avec citation de la source.
+- 🎓 **Apprentissage non paramétrique** : quand un outil échoue puis se corrige, l'agent en tire une leçon stockée dans un RAG global (ChromaDB) et réinjectée aux requêtes similaires, pour ne pas refaire la même erreur — sans ré-entraînement du modèle.
 - 🔁 **Multi-provider LLM** commutable à chaud : OpenRouter, OpenAI, Ollama (local).
 - 💻 **TUI riche** : panneaux `rich`, complétion et historique `prompt-toolkit`, commandes slash.
 - ⏳ **Retour visuel** : spinners pendant l'attente de l'agent et les phases de mémoire, affichage de la réponse **avant** la mémorisation, compteur de tokens du contexte mémoire après chaque réponse.
-- 🔁 **Résilience** : erreur MCP → rechargement automatique des outils + nouvelle tentative ; erreur LLM → propagée proprement.
+- 🔁 **Résilience & auto-correction** : erreur d'outil → renvoyée au modèle comme observation pour qu'il se corrige dans le tour ; erreur MCP (transport) → rechargement automatique des outils + nouvelle tentative ; erreur LLM → propagée proprement.
 
 
-![TUI](./docs/tui.png) 
+![TUI](./docs/tui.png)
 
 ---
 
@@ -79,8 +79,8 @@ AgentAuditIA/
 │   │ SQLite (résumé) │            │                      │
 │   │ ChromaDB (faits)│            │  HTTP / MCP          │
 │   │ ChromaDB (docs) │            ▼                      │
-│   └─────────────────┘    ┌────────────────┐             │
-│                          │   MCP_Server   │             │
+│   │ ChromaDB (leçons)│   ┌────────────────┐             │
+│   └─────────────────┘    │   MCP_Server   │             │
 │                          │  (FastMCP)     │             │
 │                          └────────────────┘             │
 └─────────────────────────────────────────────────────────┘
@@ -89,11 +89,12 @@ AgentAuditIA/
 ### Flux d'un tour de conversation
 
 1. L'utilisateur saisit un message dans la TUI.
-2. `AgentLG.run()` construit le contexte mémoire (résumé + faits RAG + connaissances de référence).
+2. `AgentLG.run()` construit le contexte mémoire (résumé + faits RAG + connaissances de référence + leçons apprises pertinentes).
 3. Le graphe LangGraph invoque le LLM avec les outils MCP disponibles.
-4. Si le LLM appelle un outil, `MCPClientWrapper` exécute la requête sur le `MCP_Server`.
+4. Si le LLM appelle un outil, `MCPClientWrapper` exécute la requête sur le `MCP_Server`. En cas d'erreur d'outil, le message est renvoyé au modèle comme observation pour qu'il se corrige.
 5. La réponse est affichée **avant** la mémorisation (UX réactive).
 6. `MemoryBrain` met à jour le résumé (si seuil tokens dépassé) et extrait les nouveaux faits.
+7. Si un outil a échoué pendant le tour, `MemoryBrain.reflect` en tire une **leçon** réutilisable, indexée dans le RAG d'apprentissage.
 
 ---
 
@@ -122,8 +123,23 @@ L'agent conserve deux niveaux de mémoire complémentaires, **isolés par sessio
 persistence_memory/
 ├── summaries.sqlite      # Résumés court terme par session
 ├── chroma_facts/         # Faits long terme (vectoriel)
-└── chroma_knowledge/     # Connaissances de référence (RAG lecture seule)
+├── chroma_knowledge/     # Connaissances de référence (RAG lecture seule)
+└── chroma_lessons/       # Leçons apprises des erreurs d'outil (RAG global)
 ```
+
+---
+
+## 🎓 Apprentissage (RAG de leçons)
+
+Au-delà de la mémoire, l'agent **apprend de ses erreurs d'outil** — sans jamais toucher aux poids du modèle (apprentissage *non paramétrique*).
+
+- **Réflexion** : quand un outil échoue puis se corrige dans le même tour, `MemoryBrain.reflect` analyse la trace et en distille une **leçon** impérative (« pour cet outil, utilise plutôt telle valeur »).
+- **Mémorisation** : la leçon est indexée dans une collection ChromaDB **distincte et globale** (`persistence_memory/chroma_lessons/`), partagée par **toutes les sessions**, avec dédoublonnage sémantique.
+- **Réinjection** : à une demande similaire, les leçons pertinentes sont réinjectées dans le contexte **avant** que l'agent agisse, pour qu'il évite l'erreur d'emblée.
+- **Coût maîtrisé** : la réflexion (appel LLM) ne se déclenche **que** sur erreur d'outil, jamais à vide.
+- **Curation** : commande `/lessons` pour inspecter, supprimer ou purger ce que l'agent a retenu.
+
+> Différence avec l'auto-correction : l'auto-correction agit *dans* le tour (le modèle se reprend après une erreur) ; l'apprentissage, lui, évite de **refaire** l'erreur aux tours suivants — et dans n'importe quelle session.
 
 ---
 
@@ -137,17 +153,18 @@ src/agent_ia/
 │   ├── agent_lg.py          # AgentLG : orchestrateur principal
 │   ├── agent_context.py     # AgentContext : état partagé de session
 │   ├── runtime.py           # create_session() : assemblage du contexte
-│   ├── logger/              # AgentLogger (niveaux), NullLogger
+│   ├── logger/              # AgentLogger (niveaux), NullLogger, step_format
 │   ├── exceptions/          # ModelTaskError, ToolTaskError
 │   └── memory/
-│       ├── session_memory.py        # Gestion du buffer, résumé, faits, connaissances
-│       ├── memory_brain.py          # LLM dédié résumé & extraction de faits
+│       ├── session_memory.py        # Buffer, résumé, faits, connaissances, leçons
+│       ├── memory_brain.py          # LLM dédié : résumé, extraction de faits, réflexion
 │       ├── short_memory/            # MemoryStore — persistance SQLite
 │       └── rag/
 │           ├── retriever.py         # Interface Retriever + RetrievedItem
 │           ├── chroma_vector_store.py   # Mécanique cosinus partagée
 │           ├── facts_rag/           # VectorFactStore (Chroma)
-│           └── knowledge_rag/       # VectorKnowledgeStore (Chroma, lecture seule)
+│           ├── knowledge_rag/       # VectorKnowledgeStore (Chroma, lecture seule)
+│           └── experience_rag/      # VectorExperienceStore (Chroma, leçons globales)
 ├── llm/
 │   ├── llm_factory.py       # Instancie le bon ChatModel selon le provider
 │   └── loader.py            # Charge llm_config.yaml
@@ -247,6 +264,7 @@ Transport, URL et headers (auth / identité de l'agent) de chaque serveur MCP à
 | `/status` | Affiche session, provider, modèle, outils chargés, mode debug. |
 | `/tools [reload]` | Liste les outils MCP, ou les recharge à chaud. |
 | `/facts [clear \| rm <n>...]` | Liste les faits mémorisés, supprime ceux ciblés ou efface toute la mémoire. |
+| `/lessons [clear \| rm <n>...]` | Liste les leçons apprises des erreurs d'outil, supprime celles ciblées ou les efface toutes. |
 | `/session [list \| <id> \| rm <id>]` | Liste les sessions, bascule sur une session (créée si inconnue), ou supprime. |
 | `/provider [nom]` | Affiche ou change le provider LLM à chaud. |
 | `/model [nom]` | Affiche ou change le modèle LLM à chaud. |
@@ -284,6 +302,8 @@ poetry run pytest
 Les tests couvrent notamment :
 - La détection et le filtrage de la fuite de connaissances de référence vers les faits (`test_session_memory_leak.py`).
 - Le RAG de connaissances : idempotence, indépendance des sources, `delete_source`, `reset` (`test_knowledge_store.py`).
+- L'apprentissage : indexation et dédoublonnage des leçons (`test_experience_store.py`), réflexion sur erreur d'outil (`test_session_memory_reflect.py`), formatage de la trace d'étapes et détection d'erreur (`test_step_format.py`).
+- L'auto-correction sur erreur d'outil (`test_tool_error_handling.py`).
 - Les tests d'intégration agent (`test_agent.py`) nécessitent un LLM accessible.
 
 ---
@@ -297,6 +317,7 @@ Les tests couvrent notamment :
 | LLM providers | OpenRouter · OpenAI · Ollama |
 | Mémoire court terme | SQLite (`aiosqlite`) |
 | Mémoire long terme | ChromaDB (vectoriel, cosinus) |
+| Apprentissage | ChromaDB (leçons globales, non paramétrique) |
 | TUI | `rich` · `prompt-toolkit` |
 | Config | YAML (`pyyaml`) · `python-dotenv` |
 | Tests | `pytest` · `pytest-asyncio` |
